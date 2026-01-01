@@ -596,8 +596,277 @@ impl_Debug! {
 #[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 mod imp {
     use super::*;
-    impl_Display!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize; as u64 into display_u64);
+    impl_Display!(i8, u8, i16, u16, i32, u32; as u64 into display_u64);
     impl_Exp!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize; as u64 into exp_u64);
+
+    // Optimized path for u64/i64/usize/isize using BCD (Binary-Coded Decimal)
+    // conversion with 4-digit-at-a-time processing.
+    use crate::fmt;
+    use crate::mem::MaybeUninit;
+
+    #[stable(feature = "rust1", since = "1.0.0")]
+    impl fmt::Display for u64 {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            #[cfg(not(feature = "optimize_for_size"))]
+            {
+                const MAX_DEC_N: usize = u64::MAX.ilog10() as usize + 1;
+                let mut buf = [MaybeUninit::<u8>::uninit(); MAX_DEC_N];
+                // SAFETY: `buf` is always big enough to contain all the digits.
+                unsafe { f.pad_integral(true, "", self._fmt(&mut buf)) }
+            }
+            #[cfg(feature = "optimize_for_size")]
+            {
+                display_u64_small(*self, true, f)
+            }
+        }
+    }
+
+    #[stable(feature = "rust1", since = "1.0.0")]
+    impl fmt::Display for i64 {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            #[cfg(not(feature = "optimize_for_size"))]
+            {
+                const MAX_DEC_N: usize = u64::MAX.ilog10() as usize + 1;
+                let mut buf = [MaybeUninit::<u8>::uninit(); MAX_DEC_N];
+                // SAFETY: `buf` is always big enough to contain all the digits.
+                unsafe { f.pad_integral(*self >= 0, "", self.unsigned_abs()._fmt(&mut buf)) }
+            }
+            #[cfg(feature = "optimize_for_size")]
+            {
+                display_u64_small(self.unsigned_abs(), *self >= 0, f)
+            }
+        }
+    }
+
+    /// Converts a u64 to decimal ASCII digits in the buffer, returning the offset
+    /// where the digits start.
+    ///
+    /// Uses BCD (Binary-Coded Decimal) conversion with 4-digit-at-a-time processing.
+    /// The buffer must have length >= the number of digits in `value`.
+    fn fmt_u64_to_buf(value: u64, buf: &mut [MaybeUninit<u8>]) -> usize {
+        /// Converts a 4-digit decimal number (0-9999) to BCD format where each
+        /// byte contains one digit (0x00-0x09). Uses division-by-multiplication
+        /// tricks to avoid expensive division instructions.
+        fn to_bcd4(abcd: u16) -> u32 {
+            let abcd = u32::from(abcd);
+            // Divide by 100 using multiplication: (abcd * 0x147b) >> 19 ≈ abcd / 100
+            let ab_cd = abcd + (0x10000 - 100) * ((abcd * 0x147b) >> 19);
+            // Divide each 2-digit pair by 10 using multiplication
+            let a_b_c_d = ab_cd + (0x100 - 10) * (((ab_cd * 0x67) >> 10) & 0xf000f);
+            a_b_c_d
+        }
+
+        // We write 4-byte chunks at specific offsets from the end of the buffer.
+        // The `end` pointer points one past the last element.
+        // SAFETY: A one-past-the-end pointer is always valid for a slice.
+        // We only use this for offset calculations via `sub()`, never for dereferencing.
+        let end = unsafe { buf.as_mut_ptr().add(buf.len()).cast::<u32>() };
+
+        let digits_written = if value < 10_000 {
+            let bcd = to_bcd4(value as u16);
+            let leading_zeros = (bcd | 1).leading_zeros() as usize / 8;
+            // SAFETY: For values < 10_000, we write 4 bytes ending at buf's end.
+            // The buffer has length >= 4 (enough for values up to 9999).
+            // `write_unaligned` is used because `buf` is a byte array with no
+            // alignment guarantee for u32.
+            unsafe {
+                end.sub(1).write_unaligned((bcd | 0x30303030).to_be());
+            }
+            4 - leading_zeros
+        } else if value < 100_000_000 {
+            let bcd_hi = to_bcd4((value / 10_000) as u16);
+            let bcd_lo = to_bcd4((value % 10_000) as u16);
+            let leading_zeros = bcd_hi.leading_zeros() as usize / 8;
+            // SAFETY: For values < 100_000_000, we write 8 bytes ending at buf's end.
+            // The buffer has length >= 8 (enough for values up to 99999999).
+            // `write_unaligned` is used because `buf` is a byte array with no
+            // alignment guarantee for u32.
+            unsafe {
+                end.sub(2).write_unaligned((bcd_hi | 0x30303030).to_be());
+                end.sub(1).write_unaligned((bcd_lo | 0x30303030).to_be());
+            }
+            8 - leading_zeros
+        } else if value < 10_000_000_000_000_000 {
+            let hi = (value / 100_000_000) as u32;
+            let lo = (value % 100_000_000) as u32;
+            let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+            let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+            let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+            let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+            let leading_zeros =
+                ((u64::from(bcd_hi_hi) << 32) | u64::from(bcd_hi_lo)).leading_zeros() as usize / 8;
+            // SAFETY: For values < 10^16, we write 16 bytes ending at buf's end.
+            // The buffer has length >= 16 (enough for values up to 10^16 - 1).
+            // `write_unaligned` is used because `buf` is a byte array with no
+            // alignment guarantee for u32.
+            unsafe {
+                end.sub(4).write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+                end.sub(3).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+                end.sub(2).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+                end.sub(1).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+            }
+            16 - leading_zeros
+        } else {
+            let top = value / 10_000_000_000_000_000;
+            let hi = (value % 10_000_000_000_000_000 / 100_000_000) as u32;
+            let lo = (value % 100_000_000) as u32;
+            let bcd_top = to_bcd4(top as u16);
+            let bcd_hi_hi = to_bcd4((hi / 10_000) as u16);
+            let bcd_hi_lo = to_bcd4((hi % 10_000) as u16);
+            let bcd_lo_hi = to_bcd4((lo / 10_000) as u16);
+            let bcd_lo_lo = to_bcd4((lo % 10_000) as u16);
+            let leading_zeros = bcd_top.leading_zeros() as usize / 8;
+            // SAFETY: For values >= 10^16 (17-20 digits), we write up to 20 bytes
+            // ending at buf's end. The buffer has length >= 19 (i64 passes a 19-byte
+            // buffer since i64::MAX has 19 digits). `write_unaligned` is used because
+            // `buf` is a byte array with no alignment guarantee for u32.
+            unsafe {
+                end.sub(4).write_unaligned((bcd_hi_hi | 0x30303030).to_be());
+                end.sub(3).write_unaligned((bcd_hi_lo | 0x30303030).to_be());
+                end.sub(2).write_unaligned((bcd_lo_hi | 0x30303030).to_be());
+                end.sub(1).write_unaligned((bcd_lo_lo | 0x30303030).to_be());
+                // For 20-digit numbers, write the top 4 digits as a u32.
+                // For 17-19 digits, write byte-by-byte to avoid writing before
+                // the buffer start (i64 passes a 19-byte buffer).
+                if leading_zeros == 0 {
+                    end.sub(5).write_unaligned((bcd_top | 0x30303030).to_be());
+                } else {
+                    let top_bytes = (bcd_top | 0x30303030).to_be_bytes();
+                    let out = end.cast::<u8>();
+                    for i in leading_zeros..4 {
+                        out.sub(20 - i).write(top_bytes[i]);
+                    }
+                }
+            }
+            20 - leading_zeros
+        };
+
+        buf.len() - digits_written
+    }
+
+    impl u64 {
+        #[doc(hidden)]
+        #[unstable(
+            feature = "fmt_internals",
+            reason = "specialized method meant to only be used by `SpecToString` implementation",
+            issue = "none"
+        )]
+        pub unsafe fn _fmt<'a>(self, buf: &'a mut [MaybeUninit<u8>]) -> &'a str {
+            let offset = fmt_u64_to_buf(self, buf);
+            // SAFETY: Starting from `offset`, all elements of the slice have been set.
+            unsafe { slice_buffer_to_str(buf, offset) }
+        }
+
+        #[doc(hidden)]
+        #[unstable(feature = "int_format_into", issue = "138215")]
+        pub fn format_into(self, buf: &mut NumBuffer<Self>) -> &str {
+            #[cfg(not(feature = "optimize_for_size"))]
+            // SAFETY: `buf` will always be big enough to contain all digits.
+            unsafe {
+                self._fmt(&mut buf.buf)
+            }
+            #[cfg(feature = "optimize_for_size")]
+            {
+                let offset = display_u64_in_buf_small(self, &mut buf.buf);
+                // SAFETY: Starting from `offset`, all elements of the slice have been set.
+                unsafe { slice_buffer_to_str(&buf.buf, offset) }
+            }
+        }
+    }
+
+    impl i64 {
+        #[doc(hidden)]
+        #[unstable(feature = "int_format_into", issue = "138215")]
+        pub fn format_into(self, buf: &mut NumBuffer<Self>) -> &str {
+            #[cfg(not(feature = "optimize_for_size"))]
+            {
+                let mut offset = fmt_u64_to_buf(self.unsigned_abs(), &mut buf.buf);
+                if self < 0 {
+                    offset -= 1;
+                    buf.buf[offset].write(b'-');
+                }
+                // SAFETY: Starting from `offset`, all elements of the slice have been set.
+                unsafe { slice_buffer_to_str(&buf.buf, offset) }
+            }
+            #[cfg(feature = "optimize_for_size")]
+            {
+                let mut offset = display_u64_in_buf_small(self.unsigned_abs(), &mut buf.buf);
+                if self < 0 {
+                    offset -= 1;
+                    buf.buf[offset].write(b'-');
+                }
+                // SAFETY: Starting from `offset`, all elements of the slice have been set.
+                unsafe { slice_buffer_to_str(&buf.buf, offset) }
+            }
+        }
+    }
+
+    // usize and isize delegate to u64/i64 on 64-bit platforms
+    #[stable(feature = "rust1", since = "1.0.0")]
+    impl fmt::Display for usize {
+        #[inline]
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            (*self as u64).fmt(f)
+        }
+    }
+
+    #[stable(feature = "rust1", since = "1.0.0")]
+    impl fmt::Display for isize {
+        #[inline]
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            (*self as i64).fmt(f)
+        }
+    }
+
+    impl usize {
+        #[doc(hidden)]
+        #[unstable(
+            feature = "fmt_internals",
+            reason = "specialized method meant to only be used by `SpecToString` implementation",
+            issue = "none"
+        )]
+        #[inline]
+        pub unsafe fn _fmt<'a>(self, buf: &'a mut [MaybeUninit<u8>]) -> &'a str {
+            // SAFETY: Caller guarantees buf is large enough.
+            unsafe { (self as u64)._fmt(buf) }
+        }
+
+        #[doc(hidden)]
+        #[unstable(feature = "int_format_into", issue = "138215")]
+        #[inline]
+        pub fn format_into(self, buf: &mut NumBuffer<Self>) -> &str {
+            // SAFETY: NumBuffer<usize> and NumBuffer<u64> have the same layout on 64-bit
+            unsafe { (self as u64)._fmt(&mut buf.buf) }
+        }
+    }
+
+    impl isize {
+        #[doc(hidden)]
+        #[unstable(feature = "int_format_into", issue = "138215")]
+        #[inline]
+        pub fn format_into(self, buf: &mut NumBuffer<Self>) -> &str {
+            #[cfg(not(feature = "optimize_for_size"))]
+            {
+                let mut offset = fmt_u64_to_buf((self as i64).unsigned_abs(), &mut buf.buf);
+                if self < 0 {
+                    offset -= 1;
+                    buf.buf[offset].write(b'-');
+                }
+                // SAFETY: Starting from `offset`, all elements of the slice have been set.
+                unsafe { slice_buffer_to_str(&buf.buf, offset) }
+            }
+            #[cfg(feature = "optimize_for_size")]
+            {
+                let mut offset =
+                    display_u64_in_buf_small((self as i64).unsigned_abs(), &mut buf.buf);
+                if self < 0 {
+                    offset -= 1;
+                    buf.buf[offset].write(b'-');
+                }
+                unsafe { slice_buffer_to_str(&buf.buf, offset) }
+            }
+        }
+    }
 }
 
 #[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
